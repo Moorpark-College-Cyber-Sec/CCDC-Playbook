@@ -1,64 +1,87 @@
-# Linux Hardening + Persistence-Hunt Playbook
+# Linux hardening playbook
 
-Blue-team hardening scripts for CCDC. Two flavors, same core logic
-(persistence hunt → backup → dry-run gate → harden → egress control →
-tripwire):
+These scripts are templates for authorized CCDC blue-team work. Inventory first,
+map dependencies, keep console access, and verify the required service paths
+after every change. Neither script has been validated against a live competition
+image.
 
-| Script | Use it on |
-|--------|-----------|
-| `harden-linux.sh` | **Any** host. Auto-detects RHEL / Debian / Arch family and swaps package manager, firewall, MAC layer, and web paths. Start here. |
-| `harden-ecom.sh`  | Rocky 9 "Ecom" web/DB box specifically. Same logic, pre-tuned to that role (httpd/PHP/DB). |
+| Script | Scope |
+| --- | --- |
+| [`harden-ecom.sh`](harden-ecom.sh) | Rocky Linux 9 store host. Captures an inventory by default and makes higher-risk controls opt-in. |
+| [`harden-linux.sh`](harden-linux.sh) | Portable persistence hunt and broad hardening for other Linux hosts. Generic `--apply` requires `--ack-generic-apply` after host-specific review. |
 
-## Golden rule: dry-run first
+## What changed from Claude's original draft
 
-Neither script changes anything until you pass `--apply`. The default run
-only **hunts and reports** — read the red `[XX]` lines before you commit.
+The earlier e-commerce profile invoked the portable script's full `--apply`
+path before changing the web and database services. This version gives the
+Rocky profile its own inventory and apply sequence.
+
+| Earlier behavior | Revised Rocky profile |
+| --- | --- |
+| Generic SSH, kernel, firewall, PHP, and MAC changes ran first. | Baseline is scoped to Rocky 9 and requires an explicit active firewalld interface and zone. |
+| Outbound traffic became default deny with a small allowlist. | Outbound deny is opt-in with `--enable-egress` after mapping DNS, time, updates, payment, mail, database, and logging flows. |
+| PHP functions and SELinux web booleans were changed globally. | Current settings are recorded for review; the script does not toggle them wholesale. |
+| Apache was restarted and webroot permissions changed recursively. | No web service restart or webroot mutation. |
+| Database bind address, grants, and service state were changed. | No automatic database changes. |
+| Password and root SSH behavior followed the generic script. | `--key-only` requires a preflighted admin key; `--deny-root-ssh` is separate. The baseline preserves existing password and root login settings. |
+| Broad inbound and reverse-path filtering could affect availability. | Required inbound services are added without source filters; pruning is opt-in. Strict `rp_filter` is not forced and ICMP echo is not blocked. |
+
+The portable script remains available for investigation. Its apply path is
+broad: it can change SSH, egress, PHP, SELinux/AppArmor, password policy, and
+services. Review its full output and test on a matching lab host before using
+`--ack-generic-apply`.
+
+## Rocky workflow
+
+Run these commands from the repository root on the Rocky host. Inventory writes
+private evidence under `/root/ccdc-hardening/` without changing host settings.
 
 ```bash
-sudo ./harden-linux.sh            # report only: inventory + persistence hunt, no changes
-sudo ./harden-linux.sh --hunt-only # just the persistence hunt, then stop
+sudo bash scripts/harden-ecom.sh
+sudo ls -dt /root/ccdc-hardening/* | head
+ip -br address
+sudo firewall-cmd --get-active-zones
 ```
 
-## Applying it (do the SSH key step — it prevents lockout)
+Review listeners, accounts, keys, firewall state, SELinux booleans, and store
+dependencies. Once the production interface is identified, apply the baseline:
 
 ```bash
-# Apply hardening AND install your team key in one go. Passwords are only
-# disabled once a key is in place, so you can't lock yourself out.
-sudo ./harden-linux.sh --apply --ssh-key "ssh-ed25519 AAAA...your_key... team@host"
+sudo bash scripts/harden-ecom.sh --apply --interface <interface>
 ```
 
-Flags:
+The default inbound services are `ssh,http,https`. Add any other required
+service or port through `--in-services` and `--in-ports`. Test remote SSH,
+HTTP/HTTPS content, ping, and the full store workflow immediately after apply.
 
-- `--apply` — actually make changes (otherwise everything is a dry-run preview).
-- `--ssh-key "<pubkey>"` — install this key for the sudo user, then switch SSH
-  to key-only. **Without this flag the script keeps password auth ON** so a
-  missing key never locks you out.
-- `--admin <user>` — which account keeps SSH access (defaults to the sudo user).
-- `--hunt-only` — run the persistence hunt and exit.
-- `--force-family rhel|debian|arch` — override auto-detection if `/etc/os-release`
-  is missing or weird (`harden-linux.sh` only).
+| Optional flag | Use only after |
+| --- | --- |
+| `--admin USER --key-only` | A working second SSH session proves key login, and password login is not required. |
+| `--deny-root-ssh` | Root SSH is not required for operations or service checks. |
+| `--prune-inbound` | Every required inbound service has been mapped and listed. |
+| `--enable-egress --out-ports CSV` | All outbound application dependencies are mapped and tested, including IPv6. |
 
-## What it changes (all backed up first)
+Each run records a baseline, run log, after-state, and backups of overwritten
+files. A newly created file has no previous copy; remove it to undo that file.
+Firewalld changes also require inspecting the saved zone and policy state before
+rollback.
 
-Every edited file is copied under `/root/harden-<timestamp>/backup/` before it's
-touched, so rollback is one `cp`. Baselines (process/listener/account/package
-snapshots) land in `.../baseline/` — diff against them after suspicious activity.
+## IDS, IPS, decoys, and packet visibility
 
-- **SSH** — key-only (once a key exists), no root login, drop-in that sorts
-  before vendor defaults.
-- **Firewall + egress** — inbound scored services stay open to all sources and
-  **ICMP stays up**; the clamp is on *egress* (DNS/NTP/80/443 out, drop + log the
-  rest) so a popped host can't call home. Works via firewalld / ufw / nftables /
-  iptables depending on what's installed.
-- **MAC** — SELinux enforcing + web booteans off (RHEL); AppArmor enforce (Debian).
-- **Kernel/sysctl, PHP (exec family disabled), web banners, auditd watches.**
-- **Tripwire** — a 5-minute systemd timer (`harden-watch`) that logs any new
-  persistence to syslog: `journalctl -t harden-watch -f`.
+Start web and host detection in alert-only mode. Review alerts against normal
+store traffic and service checks before enabling any block rule. Keep decoys on
+non-required ports and paths. Packet mirroring needs control of an existing
+network device or sensor path; this host script does not configure a switch or
+create a sensor VM. Use scoped host logs or a short authorized packet capture
+when a mirror is unavailable.
 
-## Watch out
+## Validation
 
-- After `--apply`, **test any scored service.** The two things most likely to
-  break a real app are the PHP `disable_functions` list and the egress rules
-  (if the app makes outbound calls). Both spots print a warning telling you
-  which knob to loosen.
-- These are **defensive** tools for systems you own or defend in the competition.
+```bash
+bash -n scripts/harden-linux.sh scripts/harden-ecom.sh
+```
+
+Syntax validation does not prove firewalld policy behavior or application
+compatibility. Run inventory and staged apply on a representative Rocky 9 lab
+image, then verify SSH, web content, ping, store transactions, dependencies,
+and rollback before live use.
