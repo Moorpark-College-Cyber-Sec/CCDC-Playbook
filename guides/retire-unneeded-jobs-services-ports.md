@@ -1,4 +1,4 @@
-# Retire unneeded cron jobs, services, and ports
+# Audit and retire unneeded cron jobs, services, and ports
 
 Use this procedure on an authorized Linux host after identifying the services
 that must remain available. It is written for Rocky Linux 9 with systemd,
@@ -54,7 +54,123 @@ required traffic still works:
 | --- | --- | --- | --- | --- | --- |
 | Fill in before changing | | | | | |
 
-## 2. Retire one scheduled task
+## 2. Audit a job or service before changing it
+
+Decide **legitimacy** and **necessity** separately. A task may be legitimate
+but unnecessary on this host; an unfamiliar task may support a required
+application. Do not execute an unknown command just to see what it does.
+
+### Audit a cron entry
+
+Identify which account runs it and read the **whole** crontab, including
+`PATH`, `SHELL`, `MAILTO`, time zone, `@reboot`, and output redirection. In
+`/etc/cron.d/` and `/etc/crontab`, the entry also names its execution user.
+Cron syntax and environment affect what actually runs
+([Cronie `crontab(5)`](https://man7.org/linux/man-pages/man5/crontab.5.html)).
+
+```bash
+account=ACCOUNT_NAME
+getent passwd "$account"
+crontab -u "$account" -l
+job=/etc/cron.d/EXAMPLE_JOB
+stat -c '%U:%G %a %y %n' "$job"
+sed -n '1,160p' "$job"
+rpm -qf "$job" || :
+```
+
+Use the `job=` lines for a system cron file; a user crontab may have no
+separate `/etc/cron.d/` file. Follow each command to the **actual script or
+binary it invokes**, including anything passed to `sh -c`, an interpreter,
+or a wrapper. Check symlinks and parent-directory permissions. Substitute
+the selected path below; these commands inspect it without running it.
+
+```bash
+payload=/ABSOLUTE/PATH/TO/COMMAND_OR_SCRIPT
+readlink -f "$payload"
+namei -l "$payload"
+stat -c '%U:%G %a %y %n' "$payload"
+sha256sum "$payload"
+rpm -qf "$payload" || :
+rpm -Vf --noscripts "$payload" || :
+```
+
+`rpm -qf` identifies an owning package; `rpm -Vf --noscripts` compares that
+package's installed files with RPM metadata without running a package
+verification script. A locally maintained app file may be unowned. A changed
+package configuration file may be expected. Package ownership, a clean verify
+result, and a hash are evidence to compare with a trusted baseline, not a
+legitimacy verdict ([RPM manual](https://rpm.org/docs/latest/man/rpm.8)).
+
+Prioritize entries that run at boot, fetch and execute remote content, decode
+data before execution, call a shell from a writable or temporary path, or
+contact an unexplained network destination. Each may still have an authorized
+purpose; match it to the application owner's expected configuration and logs.
+
+Look for recent executions in the cron journal and, where configured, the
+cron log. Match time, user, command, and any child process or network activity
+to the documented purpose. Missing log entries do not prove a job did not run.
+
+```bash
+journalctl -u crond --since yesterday --no-pager
+if [[ -r /var/log/cron ]]; then grep -F "$account" /var/log/cron; fi
+```
+
+### Audit a systemd service or timer
+
+For a service, inspect its loaded state, backing unit file and drop-ins,
+effective command, execution account, restart behavior, and recent journal.
+`systemctl cat` exposes the unit files and overrides; compare them with
+`systemctl show` if a file changed without a daemon reload
+([systemd `systemctl` reference](https://www.freedesktop.org/software/systemd/man/latest/systemctl.html)).
+
+```bash
+unit=EXAMPLE.service
+systemctl status "$unit" --no-pager
+systemctl is-enabled "$unit" || :
+systemctl cat "$unit"
+systemctl show "$unit" -p FragmentPath -p DropInPaths -p ExecStart \
+  -p User -p Group -p Restart -p TriggeredBy
+journalctl -u "$unit" --since yesterday --no-pager
+systemctl list-dependencies --reverse "$unit" --no-pager
+systemctl list-sockets --all --no-pager
+systemctl list-timers --all --no-pager
+```
+
+Check the unit file, each drop-in, and the executable named in `ExecStart`
+with the same `stat`, `namei`, `sha256sum`, `rpm -qf`, and `rpm -Vf --noscripts`
+steps used above. Inspect `ExecStartPre` and other command hooks in the full
+unit file as well. For a timer, inspect its `ACTIVATES` service and schedule.
+For a listening port, use `ss -lntup` to find its PID; inspect that process's
+command and executable even if the service name looks familiar:
+
+```bash
+ss -lntup
+ps -fp PID
+readlink -f /proc/PID/exe
+```
+
+PIDs change, so confirm the PID still belongs to the same listener before
+drawing a conclusion. Unit names, descriptions, and timestamps can be forged.
+Review the actual files and compare with known-good host configuration or the
+application owner's expected deployment.
+
+These `systemctl` commands inspect system units. Also review user-level units
+in `/etc/systemd/user/` and each relevant account's
+`~/.config/systemd/user/`, and check `atq` if the `at` scheduler is installed.
+
+### Make a recorded decision
+
+| Decision | Evidence to record | Next step |
+| --- | --- | --- |
+| Keep | Named owner, expected role, required dependency or service check, expected command and execution account | Leave active; record the reason. |
+| Investigate | Unknown owner, unexpected root context, writable or hidden payload path, changed override, unexplained network destination, or behavior that differs from the claimed purpose | Preserve the unit/job, script, hash, logs, and connection evidence; escalate through incident response. |
+| Retire | Owner or requirement check confirms it is unneeded, and the application test and undo command are known | Disable only that entry or unit using the staged steps below. |
+
+One suspicious sign is enough to investigate, but it is not conclusive proof
+of compromise. Avoid deleting a suspected persistence mechanism before its
+evidence is captured. Review saved output for secrets before sharing it.
+
+## 3. Retire one scheduled task
 
 Check user crontabs, `/etc/crontab`, `/etc/cron.d/`, the periodic cron
 directories, and systemd timers. A timer can run a service even when no cron
@@ -129,7 +245,7 @@ Undo with `systemctl enable --now EXAMPLE.timer` only if it was originally
 enabled; otherwise use `systemctl start EXAMPLE.timer`. See the
 [systemd unit controls](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/configuring_basic_system_settings/managing-systemd_configuring-basic-system-settings).
 
-## 3. Stop one unneeded service
+## 4. Stop one unneeded service
 
 Map the listener to its process and unit. Inspect the unit definition, logs,
 dependencies, sockets, and timers before stopping it. A socket unit can
@@ -170,7 +286,7 @@ socket or timer in the same way. Treat remote access, network management,
 logging, time synchronization, web, and database services as required until
 their actual dependencies are known.
 
-## 4. Close one unneeded firewalld opening
+## 5. Close one unneeded firewalld opening
 
 Identify the production interface and its zone. Check whether the zone is
 shared by other interfaces or sources. Review runtime and permanent services,
@@ -226,7 +342,7 @@ Do not close a port merely because it is unfamiliar. Confirm the scoring and
 application requirements first. This procedure does not add source-only
 allowlists or disable ICMP echo.
 
-## 5. Confirm the result and keep rollback ready
+## 6. Confirm the result and keep rollback ready
 
 After each change, compare `ss -lntup`, unit and timer state, the selected zone,
 and application logs with the baseline. Test remote login, required web

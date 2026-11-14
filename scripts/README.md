@@ -5,8 +5,8 @@ map dependencies, keep console access, and verify the required service paths
 after every change. Neither script has been validated against a live competition
 image.
 
-For manual cleanup of cron jobs, services, and firewall openings, use the
-[staged retirement guide](../guides/retire-unneeded-jobs-services-ports.md).
+For manual review and cleanup of cron jobs, services, and firewall openings,
+use the [audit and retirement guide](../guides/retire-unneeded-jobs-services-ports.md).
 
 | Script | Scope |
 | --- | --- |
