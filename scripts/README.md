@@ -12,6 +12,8 @@ use the [audit and retirement guide](../guides/retire-unneeded-jobs-services-por
 | --- | --- |
 | [`harden-ecom.sh`](harden-ecom.sh) | Rocky Linux 9 store host. Captures an inventory by default and makes higher-risk controls opt-in. |
 | [`harden-linux.sh`](harden-linux.sh) | Portable persistence hunt and broad hardening for other Linux hosts. Generic `--apply` requires `--ack-generic-apply` after host-specific review. |
+| [`packet-filter.sh`](packet-filter.sh) | Standalone stateful firewall (nftables/iptables). Prints the ruleset by default; `--test` applies with an automatic rollback so a bad rule can't lock you out. Required inbound services and ICMP echo stay open; egress clamp and default-deny are the applied modes, not the dry-run. |
+| [`fim.sh`](fim.sh) | File-integrity monitor. Baselines known-good hashes and reports additions, changes, and removals outside an ignore-list. Detection only — it changes nothing — and installs as a systemd timer that logs drift to syslog. |
 
 ## What changed from Claude's original draft
 
@@ -78,10 +80,18 @@ network device or sensor path; this host script does not configure a switch or
 create a sensor VM. Use scoped host logs or a short authorized packet capture
 when a mirror is unavailable.
 
+Two standalone host tools support this work. `packet-filter.sh` is a dedicated
+stateful firewall: review its ruleset with the default dry-run, then apply it
+with `--test` (which auto-rolls-back after a timeout unless you `--commit`), so
+you never lose console access to a bad rule. `fim.sh` is a detection-only
+file-integrity monitor — baseline the host once it is known-good, then run
+`--check` or `--install` to be alerted when files drift outside your whitelist.
+Capture the integrity baseline after hardening, not before.
+
 ## Validation
 
 ```bash
-bash -n scripts/harden-linux.sh scripts/harden-ecom.sh
+bash -n scripts/harden-linux.sh scripts/harden-ecom.sh scripts/packet-filter.sh scripts/fim.sh
 ```
 
 Syntax validation does not prove firewalld policy behavior or application
