@@ -5,6 +5,9 @@ map dependencies, keep console access, and verify the required service paths
 after every change. Neither script has been validated against a live competition
 image.
 
+For manual cleanup of cron jobs, services, and firewall openings, use the
+[staged retirement guide](../guides/retire-unneeded-jobs-services-ports.md).
+
 | Script | Scope |
 | --- | --- |
 | [`harden-ecom.sh`](harden-ecom.sh) | Rocky Linux 9 store host. Captures an inventory by default and makes higher-risk controls opt-in. |
