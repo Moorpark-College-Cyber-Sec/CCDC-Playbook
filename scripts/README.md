@@ -32,9 +32,28 @@ Rocky profile its own inventory and apply sequence.
 | Broad inbound and reverse-path filtering could affect availability. | Required inbound services are added without source filters; pruning is opt-in. Strict `rp_filter` is not forced and ICMP echo is not blocked. |
 
 The portable script remains available for investigation. Its apply path is
-broad: it can change SSH, egress, PHP, SELinux/AppArmor, password policy, and
+broad: it can change SSH, kernel settings, password policy, audit rules, and
 services. Review its full output and test on a matching lab host before using
-`--ack-generic-apply`.
+`--ack-generic-apply`. Outbound deny, PHP function restrictions, and MAC
+changes require their own flags.
+
+### Portable script flags
+
+| Flag | Effect |
+| --- | --- |
+| `--apply --ack-generic-apply` | Apply the generic baseline after host-specific review. The default run is report-only. |
+| `--hunt-only` | Report persistence indicators and stop before hardening. |
+| `--ssh-key "KEY"` | Install the supplied public key before switching SSH password authentication off. In report-only mode it only describes this action. |
+| `--enable-egress` | Opt in to outbound default deny. Off by default. Map application dependencies first. |
+| `--out-ports PORT/PROTO,...` | Outbound allowlist for `--enable-egress`; defaults to `53/udp,53/tcp,123/udp,80/tcp,443/tcp`. It accepts TCP and UDP ports from 1 to 65535. |
+| `--php-disable-functions` | Opt in to appending a PHP `disable_functions` list. Off by default; without it the script reports current declarations and does not edit `php.ini` or restart web/PHP services. With it, validate and restart the relevant web SAPI manually. |
+| `--enable-mac` | Opt in to SELinux or AppArmor changes, including web booleans; off by default. |
+| `--force-family rhel\|debian\|arch` | Override OS-family detection. |
+
+The portable firewalld direct and iptables egress backends cover IPv4 only;
+inspect IPv6 separately. Its PHP inventory starts with the CLI primary ini and
+Debian per-SAPI files, so verify the effective web SAPI configuration before
+enabling `--php-disable-functions`.
 
 ## Rocky workflow
 

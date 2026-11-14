@@ -17,6 +17,8 @@
 #   sudo ./harden-linux.sh --apply --ack-generic-apply          # broad, host-reviewed changes
 #   sudo ./harden-linux.sh --apply --ack-generic-apply --ssh-key "ssh-ed25519 AAAA... you@team"
 #   sudo ./harden-linux.sh --apply --ack-generic-apply --force-family debian
+#   sudo ./harden-linux.sh --apply --ack-generic-apply --enable-egress --out-ports 53/udp,53/tcp,123/udp,80/tcp,443/tcp
+#   sudo ./harden-linux.sh --apply --ack-generic-apply --php-disable-functions
 #
 set -uo pipefail
 
@@ -30,6 +32,12 @@ GENERIC_ACK=0      # 1 = operator acknowledged generic apply risks
 HUNT_ONLY=0        # 1 = skip the harden phase entirely
 SSH_KEY=""         # public key installed for root+sudoers before password auth is killed
 FORCE_FAMILY=""    # rhel|debian|arch — bypass os-release detection
+ENABLE_EGRESS=0    # opt-in outbound deny
+PHP_DISABLE_FUNCTIONS=0 # opt-in PHP configuration changes
+ENABLE_MAC=0       # opt-in MAC policy changes
+OUT_PORTS="53/udp,53/tcp,123/udp,80/tcp,443/tcp"
+EGRESS_TCP_PORTS=()
+EGRESS_UDP_PORTS=()
 
 TS="$(date +%Y%m%d-%H%M%S)"
 WORKDIR="/root/ccdc-harden-${TS}"
@@ -46,11 +54,7 @@ WEB_UNITS=""       # candidate web/php units to restart
 MAC=""             # selinux | apparmor | none
 FW=""              # firewalld | ufw | nftables | iptables | none
 
-# egress allowlist: what the box is still allowed to dial OUT to.
-# DNS/NTP so the host keeps working, 80/443 so package updates and scored
-# checks that make outbound calls keep working. Everything else is dropped.
-EGRESS_TCP_PORTS="80 443"
-EGRESS_UDP_PORTS="53 123"
+# The egress allowlist is parsed from --out-ports before any host changes.
 
 # ---------------------------------------------------------------------------
 # output helpers
@@ -104,6 +108,10 @@ parse_args() {
       --hunt-only)     HUNT_ONLY=1 ;;                   # persistence hunt, no harden phase
       --ssh-key)       SSH_KEY="${2:-}"; shift ;;        # pubkey to install before killing passwords
       --force-family)  FORCE_FAMILY="${2:-}"; shift ;;   # rhel|debian|arch
+      --enable-egress) ENABLE_EGRESS=1 ;;
+      --out-ports)    [[ $# -ge 2 ]] || die "--out-ports needs a CSV value"; OUT_PORTS="$2"; shift ;;
+      --php-disable-functions) PHP_DISABLE_FUNCTIONS=1 ;;
+      --enable-mac)   ENABLE_MAC=1 ;;
       -h|--help)       usage ;;
       *)               die "unknown argument: $1 (try --help)" ;;
     esac
@@ -113,6 +121,22 @@ parse_args() {
   if [[ -n "$FORCE_FAMILY" && ! "$FORCE_FAMILY" =~ ^(rhel|debian|arch)$ ]]; then
     die "--force-family must be one of: rhel debian arch"
   fi
+
+  local entry port proto
+  local -a entries
+  [[ "$OUT_PORTS" =~ ^[0-9]{1,5}/(tcp|udp)(,[0-9]{1,5}/(tcp|udp))*$ ]] \
+    || die "--out-ports must be comma-separated PORT/tcp or PORT/udp entries"
+  IFS=, read -r -a entries <<<"$OUT_PORTS"
+  for entry in "${entries[@]}"; do
+    [[ "$entry" =~ ^([0-9]{1,5})/(tcp|udp)$ ]] || die "invalid outbound port: $entry"
+    port="${BASH_REMATCH[1]}"; proto="${BASH_REMATCH[2]}"
+    ((10#$port >= 1 && 10#$port <= 65535)) || die "outbound port out of range: $entry"
+    if [[ "$proto" == tcp ]]; then
+      EGRESS_TCP_PORTS+=("$((10#$port))")
+    else
+      EGRESS_UDP_PORTS+=("$((10#$port))")
+    fi
+  done
 }
 
 need_root() {
@@ -382,11 +406,19 @@ harden_ssh() {
       fi
     done
     keyline="PasswordAuthentication no"
-    ok "key installed — password auth will be disabled"
+    if [[ $APPLY -eq 1 ]]; then
+      ok "key installed — password auth will be disabled"
+    else
+      _emit "    would disable password auth after installing the provided key"
+    fi
   else
     # No key given: deliberately leave passwords on rather than lock you out.
     keyline="PasswordAuthentication yes"
-    warn "no --ssh-key given: leaving PasswordAuthentication ON so you keep access"
+    if [[ $APPLY -eq 1 ]]; then
+      warn "no --ssh-key given: setting PasswordAuthentication yes; verify the scored SSH path"
+    else
+      _emit "    without --ssh-key, apply would set PasswordAuthentication yes"
+    fi
   fi
 
   backup_file "$dropin"
@@ -460,6 +492,18 @@ CONF
 harden_mac() {
   head2 "harden: mandatory access control (${MAC})"
 
+  if [[ $ENABLE_MAC -eq 0 ]]; then
+    log "MAC settings unchanged; use --enable-mac after checking application policy"
+    if [[ "$MAC" == selinux ]]; then
+      _emit "    SELinux: $(getenforce 2>/dev/null || echo unknown)"
+      for b in httpd_can_network_connect httpd_can_network_connect_db \
+               httpd_can_network_relay httpd_execmem httpd_enable_cgi; do
+        getsebool "$b" 2>/dev/null | tee -a "$REPORT" || :
+      done
+    fi
+    return 0
+  fi
+
   case "$MAC" in
     selinux)
       # setenforce 1 = enforcing now; the config file makes it survive reboot.
@@ -467,14 +511,18 @@ harden_mac() {
       backup_file /etc/selinux/config
       [[ $APPLY -eq 1 ]] && sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config \
         || _emit "    would set SELINUX=enforcing in /etc/selinux/config"
-      # This boolean family is what lets a webshell dial out. Turning it off is
-      # the MAC-layer wall behind the egress rules.
+      # These application booleans are independent of the firewall and require
+      # separate dependency review before --enable-mac is selected.
       for b in httpd_can_network_connect httpd_can_network_connect_db \
                httpd_can_network_relay httpd_execmem httpd_enable_cgi; do
         # setsebool -P: persist across reboot
         run setsebool -P "$b" off
       done
-      ok "SELINUX enforcing; httpd_can_network_* booleans off"
+      if [[ $APPLY -eq 1 ]]; then
+        ok "SELinux enforcement and web boolean changes requested; verify effective state"
+      else
+        _emit "    would enforce SELinux and turn off selected httpd booleans"
+      fi
       ;;
     apparmor)
       run systemctl enable --now apparmor
@@ -485,28 +533,32 @@ harden_mac() {
       else
         _emit "    would run: systemctl enable --now apparmor && aa-enforce /etc/apparmor.d/*"
       fi
-      ok "AppArmor enabled and profiles set to enforce"
+      if [[ $APPLY -eq 1 ]]; then
+        ok "AppArmor enforcement requested; verify profile state"
+      else
+        _emit "    would enable AppArmor and enforce available profiles"
+      fi
       ;;
     *)
-      warn "no MAC layer present (normal on Arch) — the egress policy is your containment; consider installing apparmor"
+      warn "no MAC layer present (normal on Arch); review application policy separately"
       ;;
   esac
 }
 
 harden_egress() {
   head2 "harden: egress policy (backend: ${FW})"
+  log "outbound allowlist: ${OUT_PORTS}"
 
-  # The RT-frustrating move. Inbound stays wide open on scored ports so scoring
-  # never breaks; OUTBOUND becomes default-deny with a small allowlist, so a
-  # dropped webshell cannot reverse-shell home. Every drop is logged.
+  # Outbound becomes default-deny with the supplied allowlist. Review every
+  # application dependency before enabling it; backend behavior varies.
   case "$FW" in
     firewalld)
       # firewalld's backend is nftables on modern RHEL, but direct rules are
       # still translated faithfully, which keeps this portable.
-      for p in $EGRESS_TCP_PORTS; do
+      for p in "${EGRESS_TCP_PORTS[@]}"; do
         run firewall-cmd --permanent --direct --add-rule ipv4 filter OUTPUT 10 -p tcp --dport "$p" -j ACCEPT
       done
-      for p in $EGRESS_UDP_PORTS; do
+      for p in "${EGRESS_UDP_PORTS[@]}"; do
         run firewall-cmd --permanent --direct --add-rule ipv4 filter OUTPUT 10 -p udp --dport "$p" -j ACCEPT
       done
       # established/related so inbound scored connections can reply
@@ -516,51 +568,57 @@ harden_egress() {
       run firewall-cmd --permanent --direct --add-rule ipv4 filter OUTPUT 98 -j LOG --log-prefix "EGRESS-DROP: " --log-level 4
       run firewall-cmd --permanent --direct --add-rule ipv4 filter OUTPUT 99 -j DROP
       run firewall-cmd --reload
+      warn "firewalld direct rules here cover IPv4 only; inspect IPv6 egress separately"
       ;;
     ufw)
       run ufw --force default deny outgoing      # the default-deny switch
-      run ufw --force default allow incoming     # scored services stay reachable
-      for p in $EGRESS_TCP_PORTS; do run ufw allow out "${p}/tcp"; done
-      for p in $EGRESS_UDP_PORTS; do run ufw allow out "${p}/udp"; done
-      run ufw --force enable
+      for p in "${EGRESS_TCP_PORTS[@]}"; do run ufw allow out "${p}/tcp"; done
+      for p in "${EGRESS_UDP_PORTS[@]}"; do run ufw allow out "${p}/udp"; done
       warn "ufw does not log drops by prefix — run 'ufw logging medium' if you want EGRESS-DROP visibility"
+      warn "check UFW's IPv6 setting and existing inbound policy separately"
       ;;
     nftables)
+      local tcp_set udp_set tcp_rule="" udp_rule=""
+      tcp_set="$(IFS=,; echo "${EGRESS_TCP_PORTS[*]}")"
+      udp_set="$(IFS=,; echo "${EGRESS_UDP_PORTS[*]}")"
+      [[ -z "$tcp_set" ]] || tcp_rule="    tcp dport { ${tcp_set} } accept"
+      [[ -z "$udp_set" ]] || udp_rule="    udp dport { ${udp_set} } accept"
       if [[ $APPLY -eq 1 ]]; then
         # A dedicated table so we never clobber whatever else manages nftables.
-        nft -f - >>"${WORKDIR}/actions.log" 2>&1 <<'NFT'
+        nft -f - >>"${WORKDIR}/actions.log" 2>&1 <<NFT || die "nftables egress policy failed; inspect ${WORKDIR}/actions.log"
 table inet harden {
   chain output {
     type filter hook output priority 0; policy drop;
     ct state established,related accept
     oif "lo" accept
     meta l4proto { icmp, icmpv6 } accept
-    tcp dport { 80, 443 } accept
-    udp dport { 53, 123 } accept
+${tcp_rule}
+${udp_rule}
     log prefix "EGRESS-DROP: " level warn
   }
 }
 NFT
         ok "nftables table 'inet harden' installed (policy drop on output)"
       else
-        _emit "    would install nftables table 'inet harden' with policy drop on output + EGRESS-DROP logging"
+        _emit "    would install nftables table 'inet harden' with policy drop on output, ports ${OUT_PORTS}, and EGRESS-DROP logging"
       fi
       ;;
     iptables)
       run iptables -A OUTPUT -o lo -j ACCEPT
       run iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
       run iptables -A OUTPUT -p icmp -j ACCEPT
-      for p in $EGRESS_TCP_PORTS; do run iptables -A OUTPUT -p tcp --dport "$p" -j ACCEPT; done
-      for p in $EGRESS_UDP_PORTS; do run iptables -A OUTPUT -p udp --dport "$p" -j ACCEPT; done
+      for p in "${EGRESS_TCP_PORTS[@]}"; do run iptables -A OUTPUT -p tcp --dport "$p" -j ACCEPT; done
+      for p in "${EGRESS_UDP_PORTS[@]}"; do run iptables -A OUTPUT -p udp --dport "$p" -j ACCEPT; done
       run iptables -A OUTPUT -j LOG --log-prefix "EGRESS-DROP: " --log-level 4
       run iptables -A OUTPUT -j DROP
       warn "iptables rules are not persistent by default — save them (iptables-save) before you rely on this"
+      warn "iptables rules here cover IPv4 only; inspect IPv6 egress separately"
       ;;
     *)
       bad "no firewall backend found — egress is UNFILTERED; install firewalld, ufw, or nftables"
       ;;
   esac
-  ok "inbound left unfiltered by source (rule 9); ICMP explicitly allowed (rule 12)"
+  log "egress phase added no inbound source filters; verify ICMP and application flows"
 }
 
 harden_passwords() {
@@ -607,8 +665,8 @@ harden_web_php() {
 
   command -v php >/dev/null 2>&1 || { log "php not installed — skipping"; return 0; }
 
-  # php --ini prints every ini file PHP actually loads. Debian additionally
-  # splits per version and per SAPI under /etc/php/<ver>/<sapi>/php.ini.
+  # php --ini identifies the CLI primary ini. Debian also has per-SAPI php.ini
+  # files; verify the actual web SAPI separately before changing its settings.
   local inis=()
   while read -r p; do [[ -f "$p" ]] && inis+=("$p"); done < <(
     php --ini 2>/dev/null | sed -n 's/^Loaded Configuration File: *//p'
@@ -617,34 +675,26 @@ harden_web_php() {
   [[ ${#inis[@]} -eq 0 ]] && { warn "no php.ini found"; return 0; }
 
   for ini in "${inis[@]}"; do
+    _emit "    PHP ini: ${ini}"
+    grep -nE '^[[:space:]]*disable_functions[[:space:]]*=' "$ini" \
+      | sed 's/^/      /' | tee -a "$REPORT" \
+      || _emit "      no active disable_functions declaration found"
+    if [[ $PHP_DISABLE_FUNCTIONS -eq 0 ]]; then
+      continue
+    fi
     backup_file "$ini"
     if [[ $APPLY -eq 1 ]]; then
-      # These are the functions a webshell needs. Disabling them is the single
-      # highest-value PHP change — and the most likely to break a real app,
-      # which is why it is called out in the README.
-      {
-        echo ''
-        echo '; --- CCDC hardening ---'
-        echo 'disable_functions = exec,passthru,shell_exec,system,proc_open,popen,curl_exec,curl_multi_exec,parse_ini_file,show_source,pcntl_exec,dl'
-        echo 'expose_php = Off'
-        echo 'allow_url_include = Off'
-        echo 'allow_url_fopen = Off'
-        echo 'display_errors = Off'
-        echo 'log_errors = On'
-        echo 'session.cookie_httponly = 1'
-        echo 'session.cookie_secure = 1'
-        echo 'session.use_strict_mode = 1'
-      } >> "$ini"
-      ok "hardened ${ini}"
+      printf '\n; CCDC opt-in function restriction\ndisable_functions = exec,passthru,shell_exec,system,proc_open,popen,curl_exec,curl_multi_exec,parse_ini_file,show_source,pcntl_exec,dl\n' >> "$ini"
+      ok "appended disable_functions to ${ini}; validate the web SAPI before restarting it"
     else
-      _emit "    would append disable_functions + expose_php/allow_url_* hardening to ${ini}"
+      _emit "    would append disable_functions to ${ini}"
     fi
   done
 
-  # Restart only the web/php units that are actually running on this box.
-  for u in $WEB_UNITS; do
-    systemctl is-active --quiet "$u" 2>/dev/null && run systemctl restart "$u"
-  done
+  if [[ $PHP_DISABLE_FUNCTIONS -eq 1 ]]; then
+    warn "If applied, PHP changes need a staged reload/restart of the actual web SAPI; test required pages and rollback if needed"
+  fi
+  return 0
 }
 
 harden_audit() {
@@ -743,7 +793,7 @@ UNIT
 main() {
   parse_args "$@"
   if [[ $APPLY -eq 1 && $HUNT_ONLY -eq 0 && $GENERIC_ACK -eq 0 ]]; then
-    die "generic --apply changes SSH, firewall, PHP and MAC settings; add --ack-generic-apply after host-specific review"
+    die "generic --apply changes SSH, kernel, passwords and audit settings; add --ack-generic-apply after host-specific review"
   fi
   need_root
 
@@ -775,7 +825,12 @@ main() {
   harden_ssh
   harden_kernel
   harden_mac
-  harden_egress
+  if [[ $ENABLE_EGRESS -eq 1 ]]; then
+    harden_egress
+  else
+    head2 "harden: egress policy"
+    log "outbound firewall rules unchanged; use --enable-egress after mapping dependencies"
+  fi
   harden_passwords
   harden_web_php
   harden_audit
@@ -791,8 +846,8 @@ main() {
   else
     _emit ""
     _emit "Now hit every scored service and confirm it is still green."
-    _emit "If a check went red, the two usual culprits are the PHP disable_functions list"
-    _emit "and the egress allowlist (a DB or API the app calls outbound)."
+    _emit "Verify every scored service. Egress, PHP function restrictions and MAC changes"
+    _emit "were applied only if their corresponding flags were selected."
   fi
 }
 
